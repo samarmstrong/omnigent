@@ -37,7 +37,7 @@ import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -7191,3 +7191,150 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+# ── #1026: cross-process lifecycle desync recovery ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """P0.5: a cancel during SETUP must not leave ``_active_turns`` stale."""
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """P2.11: recovered desync emits a distinct, non-retryable error code."""
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(conv, timeout=5.0)
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """A non-``Exception`` ``BaseException`` for the terminal cleanup floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0.5: a BaseException during SETUP must not leave ``_active_turns`` stale."""
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+        del spec, workdir
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                break
+            await asyncio.sleep(0.02)
+
+        assert conv not in active
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)
