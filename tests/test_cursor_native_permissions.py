@@ -363,7 +363,11 @@ async def test_supervise_transcript_parks_new_call_then_releases_on_resolve(
         CursorPendingToolCall(tool_call_id="call_z\nfc", tool_name="Delete", args={"path": "/x"})
     ]
 
-    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    monkeypatch.setattr(
+        cnp,
+        "read_verified_store_binding",
+        lambda *_a, **_k: fwd._StoreBinding(tmp_path / "store.db", 0),
+    )
     (tmp_path / "store.db").write_bytes(b"")  # exists() check
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
     # Keystroke + park boundaries faked.
@@ -438,7 +442,11 @@ async def test_supervise_transcript_debounces_autoapproved_call(
         CursorPendingToolCall(tool_call_id="call_auto\nfc", tool_name="Write", args={"path": "/x"})
     ]
 
-    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    monkeypatch.setattr(
+        cnp,
+        "read_verified_store_binding",
+        lambda *_a, **_k: fwd._StoreBinding(tmp_path / "store.db", 0),
+    )
     (tmp_path / "store.db").write_bytes(b"")
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
@@ -522,7 +530,11 @@ async def test_supervise_transcript_yolo_auto_accepts_without_card(
         )
     ]
 
-    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    monkeypatch.setattr(
+        cnp,
+        "read_verified_store_binding",
+        lambda *_a, **_k: fwd._StoreBinding(tmp_path / "store.db", 0),
+    )
     (tmp_path / "store.db").write_bytes(b"")
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
 
@@ -598,7 +610,11 @@ async def test_supervise_transcript_yolo_still_parks_askquestion(
         )
     ]
 
-    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    monkeypatch.setattr(
+        cnp,
+        "read_verified_store_binding",
+        lambda *_a, **_k: fwd._StoreBinding(tmp_path / "store.db", 0),
+    )
     (tmp_path / "store.db").write_bytes(b"")
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
 
