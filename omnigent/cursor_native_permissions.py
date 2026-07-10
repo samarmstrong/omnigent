@@ -333,8 +333,10 @@ def cursor_launch_args_enable_yolo(args: list[str] | None) -> bool:
     if not args:
         return False
     for arg in args:
-        if arg in {"--yolo", "--force", "-f"} or arg.startswith("--yolo=") or arg.startswith(
-            "--force="
+        if (
+            arg in {"--yolo", "--force", "-f"}
+            or arg.startswith("--yolo=")
+            or arg.startswith("--force=")
         ):
             return True
     return False
@@ -685,23 +687,24 @@ async def supervise_cursor_transcript_elicitations(
     ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
     input, not a tool gate.
 
-    Store discovery reuses the forwarder's logic, so this binds to the same chat
-    the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
-    polls and restarts), capturing every gated tool kind without a
-    prompt-wording allowlist.
+    The prompt-verified binding is shared with the forwarder, so this can inspect
+    only the chat proven to belong to this pane. Detection is keyed by
+    ``toolCallId`` (stable across polls and restarts), capturing every gated tool
+    kind without a prompt-wording allowlist.
 
     :param base_url: Server base URL.
     :param headers: Auth/routing headers for the runner's requests.
     :param session_id: Omnigent conversation id.
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
-    :param workspace: The session's working directory (cursor's chat-dir key).
-    :param launch_epoch_ms: Wall-clock ms when this terminal launched.
+    :param workspace: Retained for supervisor API compatibility.
+    :param launch_epoch_ms: Retained for supervisor API compatibility.
     :param auth: Optional httpx auth for the runner's requests.
     :param poll_interval_s: Store poll cadence in seconds.
     :param settle_s: How long a call must stay pending before it is surfaced.
     :param auto_accept_approvals: When True, accept tool gates in-pane instead
         of mirroring ApprovalCards (yolo / force launch stance).
     """
+    del workspace, launch_epoch_ms
     # tool_call_id → {"elicitation_id": str, "task": asyncio.Task} for SURFACED
     # (parked) calls; tool_call_id → loop-time first seen pending, for calls
     # still inside the settle window (not yet surfaced).
@@ -782,9 +785,7 @@ async def supervise_cursor_transcript_elicitations(
                             session_id,
                             call.tool_call_id.splitlines()[0],
                         )
-                        await _send_cursor_keys(
-                            bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY
-                        )
+                        await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY)
                         auto_accepted_at[call.tool_call_id] = now
                         first_seen.pop(call.tool_call_id, None)
                         continue

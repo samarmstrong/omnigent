@@ -694,7 +694,7 @@ def inject_user_message(
     )
 
     token = begin_cursor_prompt_delivery(bridge_dir, content)
-    for attempt in range(1, _SUBMIT_ATTEMPTS + 1):
+    for _attempt in range(1, _SUBMIT_ATTEMPTS + 1):
         _inject_user_message_once(
             bridge_dir,
             content=content,
@@ -708,8 +708,7 @@ def inject_user_message(
         if binding is not None:
             return
     raise RuntimeError(
-        "cursor did not record the submitted prompt after "
-        f"{_SUBMIT_ATTEMPTS} injection attempts"
+        f"cursor did not record the submitted prompt after {_SUBMIT_ATTEMPTS} injection attempts"
     )
 
 

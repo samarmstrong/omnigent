@@ -303,9 +303,7 @@ def begin_cursor_prompt_delivery(bridge_dir: Path, content: str) -> str:
 
     binding = read_verified_store_binding(bridge_dir)
     stores = (
-        [binding.store_path]
-        if binding is not None
-        else list(_stores_for_workspace(workspace))
+        [binding.store_path] if binding is not None else list(_stores_for_workspace(workspace))
     )
     baselines = {str(path): _get_current_rowid(path) for path in stores if path.exists()}
     token = uuid.uuid4().hex
@@ -325,13 +323,7 @@ def _stores_for_workspace(workspace: str) -> tuple[Path, ...]:
     hash_dir = _cursor_chats_root() / _workspace_hash(workspace)
     if not hash_dir.is_dir():
         return ()
-    return tuple(
-        sorted(
-            path
-            for path in hash_dir.glob("*/store.db")
-            if path.is_file()
-        )
-    )
+    return tuple(sorted(path for path in hash_dir.glob("*/store.db") if path.is_file()))
 
 
 def _prompt_row_after(store_path: Path, content: str, after_rowid: int) -> int | None:
@@ -391,9 +383,7 @@ def verify_cursor_prompt_delivery(
     while time.monotonic() < deadline:
         binding = read_verified_store_binding(bridge_dir)
         stores = (
-            [binding.store_path]
-            if binding is not None
-            else list(_stores_for_workspace(workspace))
+            [binding.store_path] if binding is not None else list(_stores_for_workspace(workspace))
         )
         matches: list[tuple[Path, int, int]] = []
         for store_path in stores:
@@ -1185,12 +1175,11 @@ async def forward_cursor_store_to_session(
 ) -> None:
     """Tail the cursor chat store and mirror new messages into the AP session.
 
-    Discovers this session's store (newest chat under ``md5(workspace)`` created
-    at/after ``launch_epoch_ms``), then polls it, posting each new user/assistant
-    message as an ``external_conversation_item``. The high-water rowid is
-    persisted to ``bridge_dir`` so a supervisor restart resumes without
-    re-posting; if discovery resolves a *different* store than the persisted one
-    (a cold resume relaunched a fresh chat), the cursor resets to that store.
+    Waits for the injector's prompt-verified store binding, then polls it and
+    posts each new user/assistant message as an
+    ``external_conversation_item``. The high-water rowid is persisted to
+    ``bridge_dir`` so a supervisor restart resumes without re-posting. A cold
+    resume pre-seeds the same binding from the validated cursor chat id.
 
     A failed item POST never silently re-posts forever: a server *rejection* (a
     4xx, or a 5xx such as a failed DB insert) is retried for up to
@@ -1206,12 +1195,14 @@ async def forward_cursor_store_to_session(
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: The cursor-native bridge dir (holds the persisted cursor).
     :param agent_name: Agent label stamped on mirrored assistant items.
-    :param workspace: The session's working directory (cursor's chat-dir key).
+    :param workspace: Retained for supervisor API compatibility; pane identity
+        is read from the delivery metadata persisted before launch.
     :param launch_epoch_ms: Wall-clock ms when this terminal launched.
     :param poll_interval_s: Seconds between store polls.
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
     :returns: Never normally returns; cancel the task to stop it.
     """
+    del workspace
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0

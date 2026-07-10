@@ -938,9 +938,7 @@ async def test_delete_native_terminal_cancels_registered_forwarder(
         [_make_instance("cursor", "main", tmp_path)],
     )
     resource_registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    resource_registry._terminal_roles[(conversation_id, terminal_id)] = (
-        CURSOR_NATIVE_TERMINAL_ROLE
-    )
+    resource_registry._terminal_roles[(conversation_id, terminal_id)] = CURSOR_NATIVE_TERMINAL_ROLE
     app = create_runner_app(
         resource_registry=resource_registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -951,9 +949,7 @@ async def test_delete_native_terminal_cancels_registered_forwarder(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
-        resp = await c.delete(
-            f"/v1/sessions/{conversation_id}/resources/terminals/{terminal_id}"
-        )
+        resp = await c.delete(f"/v1/sessions/{conversation_id}/resources/terminals/{terminal_id}")
 
     assert resp.status_code == 200
     assert forwarder.cancelled()
