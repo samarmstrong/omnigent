@@ -155,6 +155,18 @@ def test_inject_user_message_clears_before_pasting(
     captured = _install_fake_tmux(monkeypatch, pane_captures=["Add a follow-up hello marker"])
     # Avoid real sleeps in the paste-commit settle.
     monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+    from omnigent import cursor_native_forwarder
+
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "begin_cursor_prompt_delivery",
+        lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "verify_cursor_prompt_delivery",
+        lambda *_a, **_k: object(),
+    )
 
     cursor_native_bridge.inject_user_message(bridge_dir, content="hello marker")
 
@@ -167,6 +179,66 @@ def test_inject_user_message_clears_before_pasting(
     assert not any("C-a" in cmd or "C-k" in cmd for cmd in captured)
     # Submit still happens last.
     assert any("send-keys" in cmd and "Enter" in cmd for cmd in captured)
+
+
+def test_inject_user_message_retries_when_cursor_does_not_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tmux-success/store-miss retries once before acknowledging delivery."""
+    from omnigent import cursor_native_forwarder
+
+    attempts: list[str] = []
+    verification = iter([None, object()])
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_inject_user_message_once",
+        lambda _bridge, *, content, timeout_s: attempts.append(content),
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "begin_cursor_prompt_delivery",
+        lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "verify_cursor_prompt_delivery",
+        lambda *_a, **_k: next(verification),
+    )
+
+    cursor_native_bridge.inject_user_message(tmp_path, content="verify me")
+
+    assert attempts == ["verify me", "verify me"]
+
+
+def test_inject_user_message_fails_after_two_unverified_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two transcript misses surface a real error instead of ``Turn started``."""
+    from omnigent import cursor_native_forwarder
+
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_inject_user_message_once",
+        lambda _bridge, *, content, timeout_s: attempts.append(content),
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "begin_cursor_prompt_delivery",
+        lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "verify_cursor_prompt_delivery",
+        lambda *_a, **_k: None,
+    )
+
+    with pytest.raises(RuntimeError, match="did not record"):
+        cursor_native_bridge.inject_user_message(tmp_path, content="missing")
+
+    assert attempts == ["missing", "missing"]
 
 
 # Idle marker so _settle_pane returns and _clear_composer settles at once.

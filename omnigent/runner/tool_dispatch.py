@@ -4279,13 +4279,13 @@ async def _session_close_via_rest(
                 timeout=30.0,
             )
             if cleanup.status_code not in (200, 404):
-                logger.warning(
+                _logger.warning(
                     "sys_session_close runtime cleanup returned %s for %s",
                     cleanup.status_code,
                     target_id,
                 )
         except Exception:  # noqa: BLE001 — metadata close remains authoritative
-            logger.warning(
+            _logger.warning(
                 "sys_session_close could not clean up native runtime for %s",
                 target_id,
                 exc_info=True,

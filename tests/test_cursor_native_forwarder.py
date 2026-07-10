@@ -323,6 +323,127 @@ class TestDiscoverStore:
         assert fwd._discover_store("/queried/workspace", launch_epoch_ms=4_000) is None
 
 
+class TestVerifiedStoreBinding:
+    """Injection binds only the store containing its post-snapshot prompt."""
+
+    @staticmethod
+    def _store_path(root: Path, workspace: str, chat_id: str) -> Path:
+        chat_dir = root / hashlib.md5(workspace.encode()).hexdigest() / chat_id
+        chat_dir.mkdir(parents=True)
+        return chat_dir / "store.db"
+
+    def test_prompt_content_binds_correct_store_in_shared_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats = tmp_path / "chats"
+        workspace = "/shared/workspace"
+        bridge = tmp_path / "bridge"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats)
+        fwd.configure_cursor_delivery(
+            bridge,
+            workspace=workspace,
+            launch_epoch_ms=1_000,
+            reset=True,
+        )
+        token = fwd.begin_cursor_prompt_delivery(bridge, "pane B prompt")
+
+        store_a = self._store_path(chats, workspace, "chat-a")
+        store_b = self._store_path(chats, workspace, "chat-b")
+        _make_store(
+            store_a,
+            [("u-a", _user("<user_query>\npane A prompt\n</user_query>"))],
+        ).close()
+        _make_store(
+            store_b,
+            [("u-b", _user("<user_query>\npane B prompt\n</user_query>"))],
+        ).close()
+
+        binding = fwd.verify_cursor_prompt_delivery(
+            bridge,
+            token,
+            timeout_s=0.1,
+            poll_interval_s=0.001,
+        )
+
+        assert binding is not None
+        assert binding.store_path == store_b
+        assert fwd.read_verified_store_binding(bridge) == binding
+
+    def test_pending_input_remains_until_exact_user_row_is_mirrored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats = tmp_path / "chats"
+        workspace = "/ws"
+        bridge = tmp_path / "bridge"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats)
+        fwd.configure_cursor_delivery(
+            bridge,
+            workspace=workspace,
+            launch_epoch_ms=1_000,
+            reset=True,
+        )
+        token = fwd.begin_cursor_prompt_delivery(bridge, "durable prompt")
+        pending_path = fwd._pending_input_path(bridge, token)
+        assert pending_path.exists()
+
+        store = self._store_path(chats, workspace, "chat")
+        _make_store(
+            store,
+            [("u", _user("<user_query>\ndurable prompt\n</user_query>"))],
+        ).close()
+        binding = fwd.verify_cursor_prompt_delivery(
+            bridge,
+            token,
+            timeout_s=0.1,
+            poll_interval_s=0.001,
+        )
+        assert binding is not None
+        assert pending_path.exists(), "verification must not consume pending input"
+        assert not fwd.resolve_cursor_pending_input(
+            bridge,
+            store_path=store,
+            rowid=99,
+        )
+        assert pending_path.exists()
+        assert fwd.resolve_cursor_pending_input(
+            bridge,
+            store_path=store,
+            rowid=1,
+        )
+        assert not pending_path.exists()
+
+    def test_uncommitted_prompt_never_creates_binding(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats = tmp_path / "chats"
+        workspace = "/ws"
+        bridge = tmp_path / "bridge"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats)
+        fwd.configure_cursor_delivery(
+            bridge,
+            workspace=workspace,
+            launch_epoch_ms=1_000,
+            reset=True,
+        )
+        token = fwd.begin_cursor_prompt_delivery(bridge, "expected")
+        store = self._store_path(chats, workspace, "other-chat")
+        _make_store(
+            store,
+            [("u", _user("<user_query>\nunrelated\n</user_query>"))],
+        ).close()
+
+        assert (
+            fwd.verify_cursor_prompt_delivery(
+                bridge,
+                token,
+                timeout_s=0.01,
+                poll_interval_s=0.001,
+            )
+            is None
+        )
+        assert fwd.read_verified_store_binding(bridge) is None
+
+
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:
         assert fwd._write_state(
@@ -591,6 +712,118 @@ async def test_post_conversation_item_shape() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_idle_wake_is_deferred_until_prompt_verified_store_is_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure-B regression: an unbound store must never emit output=None."""
+    bridge = tmp_path / "cursor-native" / "session"
+    bridge.mkdir(parents=True)
+    posted: list[str | None] = []
+
+    monkeypatch.setattr(fwd.cursor_native_status, "count_turn_ends", lambda _bridge: 1)
+    monkeypatch.setattr(fwd.cursor_native_status, "read_posted_count", lambda _bridge: 0)
+
+    async def _capture_status(
+        client: object, *, session_id: str, status: str, output: str | None = None
+    ) -> None:
+        posted.append(output)
+
+    monkeypatch.setattr(fwd, "_post_external_session_status", _capture_status)
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_unbound",
+            bridge_dir=bridge,
+            agent_name="cursor-native-ui",
+            workspace="/shared",
+            launch_epoch_ms=1_000,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.sleep(0.03)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_carries_assistant_text_from_verified_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified store's assistant prose is mandatory completion output."""
+    bridge = tmp_path / "cursor-native" / "session"
+    bridge.mkdir(parents=True)
+    store = tmp_path / _CHAT_ID / "store.db"
+    store.parent.mkdir(parents=True)
+    _make_store(
+        store,
+        [
+            ("u", _user("<user_query>\nwork\n</user_query>")),
+            ("a", _assistant([{"type": "text", "text": "final report"}])),
+        ],
+    ).close()
+    fwd._write_store_binding(bridge, store, 0)
+    posted: list[str | None] = []
+    posted_count = {"value": 0}
+
+    monkeypatch.setattr(fwd.cursor_native_status, "count_turn_ends", lambda _bridge: 1)
+    monkeypatch.setattr(
+        fwd.cursor_native_status,
+        "read_posted_count",
+        lambda _bridge: posted_count["value"],
+    )
+    monkeypatch.setattr(
+        fwd.cursor_native_status,
+        "write_posted_count",
+        lambda _bridge, value: posted_count.update(value=value),
+    )
+    monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *_a, **_k: False)
+
+    async def _noop_item(*_a, **_k) -> None:
+        return None
+
+    async def _noop_patch(*_a, **_k) -> None:
+        return None
+
+    async def _capture_status(
+        client: object, *, session_id: str, status: str, output: str | None = None
+    ) -> None:
+        posted.append(output)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _noop_item)
+    monkeypatch.setattr(fwd, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _capture_status)
+    task = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_bound",
+            bridge_dir=bridge,
+            agent_name="cursor-native-ui",
+            workspace="/shared",
+            launch_epoch_ms=1_000,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(200):
+            if posted:
+                break
+            await asyncio.sleep(0.001)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert posted == ["final report"]
+
+
 def _http_status_error(status: int) -> httpx.HTTPStatusError:
     """An ``HTTPStatusError`` carrying *status*, as ``raise_for_status`` would raise."""
     req = httpx.Request("POST", "http://test/v1/sessions/conv_1/events")
@@ -638,7 +871,7 @@ async def _drive_forwarder(
     """
     bridge_dir = tmp_path / "cursor-native" / "sess"
     bridge_dir.mkdir(parents=True)
-    monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
+    fwd._write_store_binding(bridge_dir, store, 0)
     monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
     task = asyncio.create_task(
@@ -1008,7 +1241,7 @@ class TestForwardLoopExternalSessionId:
 
         bridge_dir = tmp_path / "cursor-native" / "sess"
         bridge_dir.mkdir(parents=True)
-        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        fwd._write_store_binding(bridge_dir, store, 0)
         monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
 
         task = asyncio.create_task(
@@ -1059,7 +1292,7 @@ class TestForwardLoopExternalSessionId:
 
         bridge_dir = tmp_path / "cursor-native" / "sess"
         bridge_dir.mkdir(parents=True)
-        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        fwd._write_store_binding(bridge_dir, store, 0)
         monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
 
         task = asyncio.create_task(

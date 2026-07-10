@@ -5159,6 +5159,58 @@ async def test_session_close_patches_tombstoned_title() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_close_deletes_native_pane_after_tombstoning() -> None:
+    """Closing a native child tears down the pane/forwarder runtime too."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:auth",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                    "harness": "cursor-native",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target"})
+        if (
+            request.method == "DELETE"
+            and request.url.path
+            == "/v1/sessions/conv_target/resources/terminals/terminal_cursor_main"
+        ):
+            return httpx.Response(200, json={"deleted": True})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["closed"] is True
+    assert requests[-1] == (
+        "DELETE",
+        "/v1/sessions/conv_target/resources/terminals/terminal_cursor_main",
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_close_rejects_out_of_tree_target_without_patch() -> None:
     """
     ``sys_session_close`` refuses a target in a different spawn tree and

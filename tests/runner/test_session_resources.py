@@ -34,6 +34,7 @@ from omnigent.runner.resource_registry import (
     _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
     _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CURSOR_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -917,6 +918,46 @@ async def test_delete_terminal_returns_404_for_unknown(
 
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_delete_native_terminal_cancels_registered_forwarder(
+    tmp_path: Path,
+) -> None:
+    """Closing a cursor pane also stops its transcript/approval supervisors."""
+    from omnigent.runner import app as runner_app
+
+    conversation_id = "conv_cursor_close"
+    terminal_id = terminal_resource_id("cursor", "main")
+    terminal_registry = TerminalRegistry(
+        conversation_link_base_url="http://127.0.0.1:8000",
+    )
+    _seed_registry(
+        terminal_registry,
+        conversation_id,
+        [_make_instance("cursor", "main", tmp_path)],
+    )
+    resource_registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    resource_registry._terminal_roles[(conversation_id, terminal_id)] = (
+        CURSOR_NATIVE_TERMINAL_ROLE
+    )
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    blocker = asyncio.Event()
+    forwarder = asyncio.create_task(blocker.wait())
+    runner_app._AUTO_FORWARDER_TASKS[conversation_id] = forwarder
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        resp = await c.delete(
+            f"/v1/sessions/{conversation_id}/resources/terminals/{terminal_id}"
+        )
+
+    assert resp.status_code == 200
+    assert forwarder.cancelled()
+    assert conversation_id not in runner_app._AUTO_FORWARDER_TASKS
 
 
 @pytest.mark.asyncio
