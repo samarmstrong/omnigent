@@ -70,6 +70,57 @@ async def test_handle_async_request_raises_connect_error_on_race() -> None:
         await transport.handle_async_request(_make_request())
 
 
+@pytest.mark.asyncio
+async def test_handle_async_request_honors_read_timeout() -> None:
+    """A hung response head raises httpx.ReadTimeout after the budget."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    request = httpx.Request("GET", "http://runner/health")
+    request.extensions["timeout"] = {
+        "connect": 5.0,
+        "read": 0.05,
+        "write": 5.0,
+        "pool": 5.0,
+    }
+
+    with pytest.raises(httpx.ReadTimeout, match="timed out"):
+        await transport.handle_async_request(request)
+
+    session = reg.get("r1")
+    assert session is not None
+    assert session.in_flight == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_async_request_unlimited_read_waits() -> None:
+    """``read=None`` keeps the prior unlimited wait semantics."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    request = httpx.Request("GET", "http://runner/health")
+    request.extensions["timeout"] = {
+        "connect": 5.0,
+        "read": None,
+        "write": 5.0,
+        "pool": 5.0,
+    }
+    task = asyncio.create_task(transport.handle_async_request(request))
+    await asyncio.sleep(0.05)
+
+    session = reg.get("r1")
+    assert session is not None
+    assert len(session.in_flight) == 1
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=204))
+    reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+
+    response = await asyncio.wait_for(task, timeout=1.0)
+    assert response.status_code == 204
+
+
 # ── handle_async_request: successful response ──────────
 
 

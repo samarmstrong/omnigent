@@ -22,6 +22,8 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from collections.abc import AsyncIterator
 
@@ -36,6 +38,31 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+
+
+def _read_timeout_s(request: httpx.Request) -> float | None:
+    """Return the httpx read timeout for *request*, or ``None`` for no limit.
+
+    httpx stores timeouts on ``request.extensions["timeout"]`` as a dict of
+    ``connect`` / ``read`` / ``write`` / ``pool`` floats (or ``None`` for an
+    unlimited budget). The tunnel previously ignored this entirely, so
+    call-site ``timeout=10.0`` arguments were no-ops and parent session
+    creates raced a 30s harness-spawn wait.
+    """
+    timeout = request.extensions.get("timeout")
+    if timeout is None:
+        return None
+    if isinstance(timeout, dict):
+        read = timeout.get("read")
+    else:
+        read = getattr(timeout, "read", None)
+    if read is None:
+        return None
+    try:
+        value = float(read)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -156,8 +183,30 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 ),
             )
             # Block until the response head arrives (or the tunnel
-            # aborts the request).
-            head = await state.head_future
+            # aborts the request). Honor the caller's httpx read
+            # timeout so server→runner forwards cannot hang past the
+            # budget the call site advertised.
+            read_timeout = _read_timeout_s(request)
+            if read_timeout is None:
+                head = await state.head_future
+            else:
+                try:
+                    head = await asyncio.wait_for(state.head_future, timeout=read_timeout)
+                except TimeoutError as exc:
+                    # Best-effort cancel so a slow harness spawn does not
+                    # keep running after the AP already gave up.
+                    with contextlib.suppress(Exception):
+                        await self._registry.send_text(
+                            state.session,
+                            encode_frame(RequestCancelFrame(id=req_id)),
+                        )
+                    self._registry.close_request(self._runner_id, req_id, session=state.session)
+                    raise httpx.ReadTimeout(
+                        f"tunnel response head timed out after {read_timeout:.1f}s",
+                        request=request,
+                    ) from exc
+        except httpx.ReadTimeout:
+            raise
         except BaseException:
             # If we failed before getting head, clean up the slot so
             # we don't leak in_flight state.

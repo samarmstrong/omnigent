@@ -2161,7 +2161,7 @@ def create_app(
                             "session_id": conv.id,
                             "agent_id": conv.agent_id,
                         },
-                        timeout=10.0,
+                        timeout=60.0,
                     )
                 except Exception:
                     _logger.exception(

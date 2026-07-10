@@ -6243,6 +6243,22 @@ async def _launch_runner_on_host(
         conv.id,
         new_runner_id,
     )
+    # Cascade the new binding to direct sub-agent children. Children copy
+    # parent runner_id once at create and otherwise stay pinned to the
+    # dead pre-restart token (#1446 only heals terminal-status forwards).
+    children_by_parent = await asyncio.to_thread(
+        conversation_store.list_child_conversation_ids_by_parent,
+        [conv.id],
+    )
+    for child_id in children_by_parent.get(conv.id, []):
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id,
+                child_id,
+                new_runner_id,
+            )
+        except ConversationNotFoundError:
+            continue
 
     # Pull workspace from the session row — populated and validated
     # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
@@ -12355,6 +12371,23 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+            # Don't pin a NEW child to a dead runner token. After a host
+            # restart the parent row can still hold the pre-restart id
+            # until its next message rebinds it; inheriting that token
+            # made fresh sys_session_send children fail with
+            # runner_unavailable. Leave runner_id unset so the next
+            # host-launch / parent-rebind path can attach a live runner.
+            if (
+                inherited_runner_id is not None
+                and runner_router is not None
+                and not runner_router.runner_is_online(inherited_runner_id)
+            ):
+                _logger.warning(
+                    "Not inheriting offline runner %s onto child of parent %s",
+                    inherited_runner_id,
+                    body.parent_session_id,
+                )
+                inherited_runner_id = None
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -14168,6 +14201,10 @@ def create_sessions_router(
         _rc = await _get_runner_client(resp.id, runner_router)
         if _rc is not None and conv is not None:
             try:
+                # Must cover harness spawn bind (process_manager 30s) plus
+                # slack. WSTunnelTransport now honors this budget; the old
+                # 10s value was a no-op and let creates race the parent's
+                # 30s client timeout into empty orphan sessions.
                 await _rc.post(
                     "/v1/sessions",
                     json={
@@ -14175,7 +14212,7 @@ def create_sessions_router(
                         "agent_id": conv.agent_id,
                         "sub_agent_name": conv.sub_agent_name,
                     },
-                    timeout=10.0,
+                    timeout=60.0,
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(

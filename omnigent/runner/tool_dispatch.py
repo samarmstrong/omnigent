@@ -1627,9 +1627,6 @@ async def _execute_subagent_tool(
                     f"Install it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
-        # Create child session on the server (no initial items —
-        # those go via a separate POST so the server forwards them
-        # to the runner and triggers a turn).
         create_body: dict[str, Any] = {
             "agent_id": parent_agent_id,
             "parent_session_id": conversation_id,
@@ -1664,15 +1661,59 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-        if resp.status_code >= 400:
-            return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
-        child_data = resp.json()
-        child_session_id = child_data.get("session_id") or child_data.get("id")
-        if not child_session_id:
-            return "Error: server did not return child session_id"
-        child_wrapper_label = _session_wrapper_label(child_data)
-        created_child = True
+        # Create child session on the server (no initial items —
+        # those go via a separate POST so the server forwards them
+        # to the runner and triggers a turn). Create can take longer
+        # than a typical REST call because the server synchronously
+        # notifies the runner and may wait on harness spawn; keep the
+        # budget above that path. On timeout the server may already
+        # have the row — recover by (agent, title) lookup so we still
+        # post the message instead of leaving an empty orphan.
+        try:
+            resp = await server_client.post("/v1/sessions", json=create_body, timeout=90.0)
+        except httpx.TimeoutException as exc:
+            _logger.warning(
+                "sys_session_send create timed out for %s:%s; looking up orphan",
+                sub_agent_name,
+                session_name,
+                exc_info=True,
+            )
+            existing = await _find_existing_child_session(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent=str(sub_agent_name),
+                title=session_name,
+            )
+            if isinstance(existing, str):
+                return (
+                    f"Error: failed to create child session: "
+                    f"{type(exc).__name__}: {exc}; lookup also failed: {existing}"
+                )
+            if existing is None:
+                return f"Error: failed to create child session: {type(exc).__name__}: {exc}"
+            child_session_id = existing.get("session_id") or existing.get("id")
+            if not child_session_id:
+                return (
+                    f"Error: failed to create child session: "
+                    f"{type(exc).__name__}: {exc}; orphan lookup missing id"
+                )
+            child_wrapper_label = _session_wrapper_label(existing)
+            created_child = True
+            _logger.info(
+                "Recovered orphan child session %s after create timeout",
+                child_session_id,
+            )
+        else:
+            if resp.status_code >= 400:
+                return (
+                    f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
+                )
+            child_data = resp.json()
+            child_session_id = child_data.get("session_id") or child_data.get("id")
+            if not child_session_id:
+                return "Error: server did not return child session_id"
+            child_wrapper_label = _session_wrapper_label(child_data)
+            created_child = True
 
         # Attach a subagent_cost_budget policy to the child when requested.
         # Non-fatal: the child session is still usable without the budget.

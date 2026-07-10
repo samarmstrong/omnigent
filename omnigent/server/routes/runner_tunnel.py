@@ -44,7 +44,7 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
-_ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+_ON_RUNNER_CONNECT_TIMEOUT_SEC = 180.0
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand

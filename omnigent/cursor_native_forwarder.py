@@ -729,7 +729,11 @@ async def _patch_external_session_id(
 
 
 async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    output: str | None = None,
 ) -> None:
     """POST one ``external_session_status`` event to the Sessions API.
 
@@ -743,13 +747,47 @@ async def _post_external_session_status(
     ``session.status: idle`` edge only drives the web spinner and never wakes a
     parent, which is why this explicit post is required.
 
+    :param output: Optional last-assistant text for an ``idle`` edge. When
+        omitted the runner delivers an empty completion ("produced no
+        output") because native transcripts are owned by AP and the runner
+        refuses to invent content from local history.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, object] = {"status": status}
+    if output is not None:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
+        json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
+
+
+def _read_last_assistant_text(store_path: Path, agent_name: str) -> str | None:
+    """Return the most recent assistant prose from *store_path*, if any.
+
+    Used when posting an idle edge so the parent inbox receives real turn
+    output instead of the empty "produced no output" sentinel.
+    """
+    last: str | None = None
+    for rowid, blob_id, data in _read_blob_rows(store_path, 0):
+        item = _blob_to_item(rowid, blob_id, data, agent_name)
+        if item is None or item.item_type != "message":
+            continue
+        if item.item_data.get("role") != "assistant":
+            continue
+        content = item.item_data.get("content")
+        if not isinstance(content, list):
+            continue
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        if parts:
+            last = "\n".join(parts)
+    return last
 
 
 async def _post_conversation_item(
@@ -984,6 +1022,7 @@ async def forward_cursor_store_to_session(
                                     client, session_id=session_id, chat_id=chat_id_val
                                 )
                                 chat_id_patched = True
+                mirror_claimed_by_other = False
                 if store_path is not None and store_path.exists():
                     # cursor keeps ONE chat per working dir, so two cursor-native
                     # sessions launched in the same cwd discover the same store.
@@ -999,6 +1038,7 @@ async def forward_cursor_store_to_session(
                             store_path,
                             session_id,
                         )
+                        mirror_claimed_by_other = True
                         store_path = None
                     else:
                         items = await asyncio.to_thread(
@@ -1166,18 +1206,45 @@ async def forward_cursor_store_to_session(
                 # supervisor restart never re-wakes the parent for a turn it
                 # already reported. Best-effort: a failed post leaves the count
                 # unadvanced so the next poll retries.
+                #
+                # When another session owns the shared chat store, skip the idle
+                # wake entirely — posting idle without mirrored assistant text
+                # produced empty "completed — produced no output" parent inbox
+                # entries while the winning session held the real transcript.
                 total_turn_ends = await asyncio.to_thread(
                     cursor_native_status.count_turn_ends, bridge_dir
                 )
                 if total_turn_ends > await asyncio.to_thread(
                     cursor_native_status.read_posted_count, bridge_dir
                 ):
-                    await _post_external_session_status(
-                        client, session_id=session_id, status="idle"
-                    )
-                    await asyncio.to_thread(
-                        cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
-                    )
+                    if mirror_claimed_by_other:
+                        _logger.warning(
+                            "skipping idle wake for session=%s; cursor chat claimed "
+                            "by a sibling session",
+                            session_id,
+                        )
+                        await asyncio.to_thread(
+                            cursor_native_status.write_posted_count,
+                            bridge_dir,
+                            total_turn_ends,
+                        )
+                    else:
+                        idle_output: str | None = None
+                        if store_path is not None and store_path.exists():
+                            idle_output = await asyncio.to_thread(
+                                _read_last_assistant_text, store_path, agent_name
+                            )
+                        await _post_external_session_status(
+                            client,
+                            session_id=session_id,
+                            status="idle",
+                            output=idle_output,
+                        )
+                        await asyncio.to_thread(
+                            cursor_native_status.write_posted_count,
+                            bridge_dir,
+                            total_turn_ends,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
