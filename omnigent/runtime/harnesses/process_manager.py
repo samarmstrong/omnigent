@@ -145,6 +145,11 @@ def _resolve_harness_idle_timeout_s() -> float:
 # enough that a wedged subprocess doesn't block Omnigent shutdown.
 _RELEASE_GRACE_S = 5.0
 
+# A live streaming response can keep ``httpx.AsyncClient.aclose()`` parked.
+# Bound that first teardown step so release always reaches SIGTERM/SIGKILL;
+# otherwise an unregistered old harness can remain alive indefinitely.
+_CLIENT_CLOSE_TIMEOUT_S = 5.0
+
 # Timeout for the per-conversation socket file to appear after
 # uvicorn boots inside the runner. Cold-start of an external SDK
 # (Claude Code, Codex, etc.) plus uvicorn is typically 1–3s; the
@@ -977,11 +982,15 @@ class HarnessProcessManager:
         ``only_if_idle_cutoff`` (the idle reaper's pass cutoff) makes the
         release conditional: the entry is torn down only if it is still
         idle — untouched since the cutoff and with no turn in flight.
-        The check happens under the registry lock, atomically with the
-        unregister, so a turn that starts while an earlier entry in the
-        same reaper pass tears down can never be killed mid-flight
-        (mirrors ``pane_reaper``'s busy re-check immediately before
-        teardown).
+        The check happens under both the per-conversation spawn lock and
+        the registry lock, atomically with the unregister. The spawn lock
+        remains held through subprocess teardown so a concurrent
+        ``get_client`` cannot observe the temporarily-empty registry and
+        spawn a replacement onto the same socket while the old process is
+        still alive. This also means a turn that starts while an earlier
+        entry in the same reaper pass tears down can never be killed
+        mid-flight (mirrors ``pane_reaper``'s busy re-check immediately
+        before teardown).
 
         Note: ``_spawn_locks[conversation_id]`` is intentionally NOT
         removed here. If we removed it, a concurrent caller already
@@ -997,27 +1006,29 @@ class HarnessProcessManager:
 
         :param conversation_id: AP-allocated conversation id.
         """
-        async with self._registry_lock:
-            if only_if_idle_cutoff is not None:
-                current = self._entries.get(conversation_id)
-                if (
-                    current is None
-                    or current.last_used_at > only_if_idle_cutoff
-                    or conversation_id in self._in_flight_response_ids
-                ):
-                    _logger.info(
-                        "skipping idle reap for conversation %s: entry became "
-                        "active or was already released during the pass",
-                        conversation_id,
-                    )
-                    return
-            entry = self._entries.pop(conversation_id, None)
-            # NOTE: ``_spawn_locks[conversation_id]`` intentionally
-            # NOT popped — see this method's docstring for the
-            # per-conv lock-identity invariant rationale.
-        if entry is None:
-            return
-        await self._close_entry(entry)
+        spawn_lock = await self._get_spawn_lock(conversation_id)
+        async with spawn_lock:
+            async with self._registry_lock:
+                if only_if_idle_cutoff is not None:
+                    current = self._entries.get(conversation_id)
+                    if (
+                        current is None
+                        or current.last_used_at > only_if_idle_cutoff
+                        or conversation_id in self._in_flight_response_ids
+                    ):
+                        _logger.info(
+                            "skipping idle reap for conversation %s: entry became "
+                            "active or was already released during the pass",
+                            conversation_id,
+                        )
+                        return
+                entry = self._entries.pop(conversation_id, None)
+                # NOTE: ``_spawn_locks[conversation_id]`` intentionally
+                # NOT popped — see this method's docstring for the
+                # per-conv lock-identity invariant rationale.
+            if entry is None:
+                return
+            await self._close_entry(entry)
 
     async def shutdown(self) -> None:
         """
@@ -1139,41 +1150,53 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
-        await _wait_for_bind(process, endpoint, harness, conversation_id)
+        try:
+            await _wait_for_bind(process, endpoint, harness, conversation_id)
 
-        # ``base_url`` is required for relative-URL routing; the
-        # actual host portion is irrelevant under uds transport,
-        # but httpx insists on a syntactically-valid URL. The
-        # default httpx read-timeout (5s) is too short for SSE
-        # streams that may pause for tens of seconds during
-        # tool dispatch round-trips (action_required → AP
-        # call_tool → PATCH → resume); use a generous fixed
-        # timeout that still surfaces a genuinely-stuck harness.
-        client = httpx.AsyncClient(
-            transport=endpoint.make_transport(),
-            base_url=endpoint.base_url,
-            # S1 (security): present the per-spawn bearer token (Windows only)
-            # so the harness scaffold accepts this client and rejects any
-            # unauthenticated local peer on the loopback-TCP channel. Empty on
-            # POSIX, where the uid-isolated UDS is the access boundary.
-            headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
-            # See the comment above the constant for rationale.
-            # Connect/write/pool keep the 5s default so a vanished
-            # harness still surfaces quickly; read=None defers
-            # liveness to the heartbeat path.
-            timeout=httpx.Timeout(5.0, read=None),
-        )
-        return _SubprocessEntry(
-            process=process,
-            client=client,
-            endpoint=endpoint,
-            harness=harness,
-            # Record the model this subprocess was spawned with so a later
-            # turn requesting a different model (e.g. after ``/model``)
-            # triggers a respawn in ``get_client`` — the model is a fixed
-            # process env var, not re-read per turn.
-            model=(env or {}).get(_model_env_key(harness)),
-        )
+            # ``base_url`` is required for relative-URL routing; the
+            # actual host portion is irrelevant under uds transport,
+            # but httpx insists on a syntactically-valid URL. The
+            # default httpx read-timeout (5s) is too short for SSE
+            # streams that may pause for tens of seconds during
+            # tool dispatch round-trips (action_required → AP
+            # call_tool → PATCH → resume); use a generous fixed
+            # timeout that still surfaces a genuinely-stuck harness.
+            client = httpx.AsyncClient(
+                transport=endpoint.make_transport(),
+                base_url=endpoint.base_url,
+                # S1 (security): present the per-spawn bearer token (Windows only)
+                # so the harness scaffold accepts this client and rejects any
+                # unauthenticated local peer on the loopback-TCP channel. Empty on
+                # POSIX, where the uid-isolated UDS is the access boundary.
+                headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
+                # See the comment above the constant for rationale.
+                # Connect/write/pool keep the 5s default so a vanished
+                # harness still surfaces quickly; read=None defers
+                # liveness to the heartbeat path.
+                timeout=httpx.Timeout(5.0, read=None),
+            )
+            return _SubprocessEntry(
+                process=process,
+                client=client,
+                endpoint=endpoint,
+                harness=harness,
+                # Record the model this subprocess was spawned with so a later
+                # turn requesting a different model (e.g. after ``/model``)
+                # triggers a respawn in ``get_client`` — the model is a fixed
+                # process env var, not re-read per turn.
+                model=(env or {}).get(_model_env_key(harness)),
+            )
+        except BaseException:
+            # No registry entry exists yet, so cancellation while the child
+            # binds must clean it up before the spawn lock is released.
+            cleanup_task = asyncio.create_task(self._terminate_process(process, endpoint))
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # A second cancellation must not let propagation outrun reap.
+                await cleanup_task
+                raise
+            raise
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
         """
@@ -1193,30 +1216,47 @@ class HarnessProcessManager:
         :param entry: The bookkeeping record to tear down.
         """
         try:
-            await entry.client.aclose()
+            await asyncio.wait_for(
+                entry.client.aclose(),
+                timeout=_CLIENT_CLOSE_TIMEOUT_S,
+            )
         except Exception:
-            # A broken transport must not skip the subprocess kill below.
+            # A broken or stream-blocked transport must not skip the
+            # subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
         finally:
-            if entry.process.returncode is None:
+            await self._terminate_process(entry.process, entry.endpoint)
+
+    async def _terminate_process(
+        self,
+        process: asyncio.subprocess.Process,
+        endpoint: _HarnessEndpoint,
+    ) -> None:
+        """Best-effort terminate, reap, and endpoint cleanup."""
+        try:
+            if process.returncode is None:
                 try:
-                    entry.process.send_signal(signal.SIGTERM)
-                    await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                    process.send_signal(signal.SIGTERM)
+                    await asyncio.wait_for(process.wait(), timeout=_RELEASE_GRACE_S)
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
                     # send_signal/wait raised (e.g. the process vanished
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
                     with contextlib.suppress(Exception):
-                        entry.process.kill()
-                        await entry.process.wait()
+                        process.kill()
+                        await process.wait()
+            else:
+                with contextlib.suppress(Exception):
+                    await process.wait()
+        finally:
             with contextlib.suppress(Exception):
-                close_subprocess_transport(entry.process)
+                close_subprocess_transport(process)
             # Best-effort socket cleanup. uvicorn's atexit usually
             # handles this when SIGTERM lands cleanly, but a
             # hard-killed runner won't. No-op for TCP endpoints.
             with contextlib.suppress(Exception):
-                entry.endpoint.cleanup()
+                endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """

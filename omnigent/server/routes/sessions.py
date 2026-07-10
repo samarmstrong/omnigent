@@ -6970,10 +6970,11 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
 
 
-# Matches the create / PATCH handshake timeout — POST /v1/sessions caches
-# the spec and (for claude-native) launches the terminal pane + transcript
-# forwarder synchronously, which stays well under 10s.
-_RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
+# A cold POST /v1/sessions can synchronously wait for a harness to bind;
+# HarnessProcessManager allows that bind up to 30s.  Keep this outer tunnel
+# budget above the inner startup contract so it cannot cancel an otherwise
+# healthy spawn and immediately race message forwarding against a replacement.
+_RUNNER_SESSION_INIT_TIMEOUT_S = 60.0
 
 
 async def _ensure_runner_session_initialized(

@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses import process_manager as process_manager_module
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
@@ -703,9 +704,146 @@ class _SlowCloseClient:
         await asyncio.sleep(self._delay_s)
 
 
+class _BlockingCloseClient:
+    """Client stand-in that exposes and holds the entry-close window."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self._never = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.started.set()
+        await self._never.wait()
+
+
 class _FakeEndpoint:
     def cleanup(self) -> None:
         pass
+
+
+async def test_cancelled_spawn_reaps_child_before_replacement(
+    tmp_path: Path,
+    register_test_harness: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during bind cannot leave an unregistered child alive."""
+    del register_test_harness
+    mgr = HarnessProcessManager(tmp_parent=tmp_path)
+    mgr._started = True
+    mgr.instance_dir.mkdir(parents=True)
+
+    spawned: list[_FakeReapProc] = []
+    first_bind_started = asyncio.Event()
+    bind_calls = 0
+
+    async def fake_create_subprocess_exec(*args: object, **kwargs: object) -> _FakeReapProc:
+        del args, kwargs
+        assert all(process.returncode is not None for process in spawned)
+        process = _FakeReapProc()
+        spawned.append(process)
+        return process
+
+    async def blocking_wait_for_bind(
+        process: _FakeReapProc,
+        endpoint: process_manager_module._HarnessEndpoint,
+        harness: str,
+        conversation_id: str,
+    ) -> None:
+        nonlocal bind_calls
+        del harness, conversation_id
+        assert process is spawned[-1]
+        bind_calls += 1
+        assert endpoint.socket_path is not None
+        endpoint.socket_path.touch()
+        if bind_calls == 1:
+            first_bind_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        process_manager_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(process_manager_module, "_wait_for_bind", blocking_wait_for_bind)
+
+    first_get = asyncio.create_task(mgr.get_client("conv_cancel", _TEST_HARNESS_NAME))
+    await first_bind_started.wait()
+    socket_path = mgr.socket_path("conv_cancel")
+    assert socket_path.exists()
+    assert "conv_cancel" not in mgr._entries
+
+    first_get.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_get
+
+    assert spawned[0].killed
+    assert spawned[0].returncode is not None
+    assert not socket_path.exists()
+    assert "conv_cancel" not in mgr._entries
+
+    replacement = await mgr.get_client("conv_cancel", _TEST_HARNESS_NAME)
+    assert len(spawned) == 2
+    assert spawned[1].returncode is None
+    assert replacement is mgr._entries["conv_cancel"].client
+
+    await mgr.release("conv_cancel")
+
+
+async def test_release_blocks_replacement_spawn_until_old_process_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release racing ``get_client`` never leaves two live harnesses.
+
+    This covers an adjacent one-process invariant: ``release`` unregisters
+    an entry, then stalls closing the client while a new message calls
+    ``get_client``. Without the per-conversation lock in ``release``, the
+    new call observes no entry and spawns a second process onto the same
+    socket before the old process has been terminated.
+    """
+    mgr = HarnessProcessManager(tmp_parent=tmp_path)
+    mgr._started = True
+    old_process = _FakeReapProc()
+    old_client = _BlockingCloseClient()
+    mgr._entries["conv_race"] = _SubprocessEntry(
+        old_process,  # type: ignore[arg-type]
+        old_client,  # type: ignore[arg-type]
+        _FakeEndpoint(),  # type: ignore[arg-type]
+        "test",
+    )
+    spawned_while_old_alive: list[bool] = []
+
+    async def fake_spawn(
+        conversation_id: str,
+        harness: str,
+        env: dict[str, str] | None,
+    ) -> _SubprocessEntry:
+        del conversation_id, env
+        spawned_while_old_alive.append(not old_process.killed)
+        return _SubprocessEntry(
+            _FakeReapProc(),  # type: ignore[arg-type]
+            _SlowCloseClient(0),  # type: ignore[arg-type]
+            _FakeEndpoint(),  # type: ignore[arg-type]
+            harness,
+        )
+
+    monkeypatch.setattr(mgr, "_spawn_entry", fake_spawn)
+    monkeypatch.setattr(process_manager_module, "_CLIENT_CLOSE_TIMEOUT_S", 0.01)
+
+    release_task = asyncio.create_task(mgr.release("conv_race"))
+    await old_client.started.wait()
+    replacement_task = asyncio.create_task(mgr.get_client("conv_race", "test"))
+    await asyncio.sleep(0)
+    replacement_waited_for_release = not replacement_task.done()
+
+    await release_task
+    await replacement_task
+
+    assert replacement_waited_for_release
+    assert old_process.killed
+    assert spawned_while_old_alive == [False]
+
+    await mgr.release("conv_race")
 
 
 async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
