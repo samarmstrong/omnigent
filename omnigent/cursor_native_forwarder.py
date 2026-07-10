@@ -42,6 +42,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,6 +95,9 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 _DISCOVERY_SKEW_MS = 10_000
 
 _STATE_FILE = "cursor_forwarder.json"
+_DELIVERY_SESSION_FILE = "cursor_delivery_session.json"
+_STORE_BINDING_FILE = "cursor_store_binding.json"
+_PENDING_INPUT_PREFIX = "cursor_pending_input_"
 
 # A sibling session's persisted claim (naming the same ``store_path``) counts as
 # a LIVE owner only if its heartbeat was refreshed within this window; an older
@@ -181,6 +185,261 @@ class _ModelMirrorState:
     posted: str | None = None
 
 
+@dataclass(frozen=True)
+class _StoreBinding:
+    """Prompt-verified cursor store assigned to one terminal pane.
+
+    ``start_rowid`` is the store high-water mark captured before the prompt was
+    injected. The forwarder starts there so it mirrors the verified prompt and
+    everything cursor appends after it, but never adopts pre-existing history
+    from another pane.
+    """
+
+    store_path: Path
+    start_rowid: int
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomically write owner-local bridge JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def configure_cursor_delivery(
+    bridge_dir: Path,
+    *,
+    workspace: str,
+    launch_epoch_ms: int,
+    reset: bool,
+) -> None:
+    """Persist the pane identity used for prompt-verified store binding.
+
+    A fresh pane clears stale bindings and durable pending inputs. A cold resume
+    preserves them; :func:`preseed_resume_state` binds the known ``--resume``
+    store directly.
+    """
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    if reset:
+        with contextlib.suppress(OSError):
+            (bridge_dir / _STORE_BINDING_FILE).unlink()
+        for path in bridge_dir.glob(f"{_PENDING_INPUT_PREFIX}*.json"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+    _atomic_write_json(
+        bridge_dir / _DELIVERY_SESSION_FILE,
+        {"workspace": workspace, "launch_epoch_ms": launch_epoch_ms},
+    )
+
+
+def _read_delivery_session(bridge_dir: Path) -> tuple[str, int] | None:
+    """Return the configured ``(workspace, launch_epoch_ms)`` for this pane."""
+    try:
+        data = json.loads((bridge_dir / _DELIVERY_SESSION_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    workspace = data.get("workspace")
+    launch_epoch_ms = data.get("launch_epoch_ms")
+    if not isinstance(workspace, str) or not workspace or not isinstance(launch_epoch_ms, int):
+        return None
+    return workspace, launch_epoch_ms
+
+
+def _write_store_binding(bridge_dir: Path, store_path: Path, start_rowid: int) -> None:
+    """Persist the exact store proven to belong to this pane's injected prompt."""
+    _atomic_write_json(
+        bridge_dir / _STORE_BINDING_FILE,
+        {"store_path": str(store_path), "start_rowid": start_rowid},
+    )
+
+
+def read_verified_store_binding(bridge_dir: Path) -> _StoreBinding | None:
+    """Load the pane's prompt-verified store binding, if available."""
+    try:
+        data = json.loads((bridge_dir / _STORE_BINDING_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    store_path = data.get("store_path")
+    start_rowid = data.get("start_rowid")
+    if not isinstance(store_path, str) or not isinstance(start_rowid, int):
+        return None
+    return _StoreBinding(Path(store_path), max(0, start_rowid))
+
+
+def _pending_input_path(bridge_dir: Path, token: str) -> Path:
+    return bridge_dir / f"{_PENDING_INPUT_PREFIX}{token}.json"
+
+
+def _read_pending_input(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def begin_cursor_prompt_delivery(bridge_dir: Path, content: str) -> str:
+    """Durably retain *content* and snapshot store rowids before injection.
+
+    The file remains until the forwarder successfully mirrors the exact user
+    row. Reusing an unresolved entry for the same text makes a parent retry
+    idempotent at the durable-delivery layer.
+    """
+    session = _read_delivery_session(bridge_dir)
+    if session is None:
+        raise RuntimeError("cursor-native delivery metadata is not configured")
+    workspace, _launch_epoch_ms = session
+    for path in sorted(bridge_dir.glob(f"{_PENDING_INPUT_PREFIX}*.json")):
+        pending = _read_pending_input(path)
+        if pending is not None and pending.get("content") == content:
+            token = path.stem.removeprefix(_PENDING_INPUT_PREFIX)
+            if token:
+                return token
+
+    binding = read_verified_store_binding(bridge_dir)
+    stores = (
+        [binding.store_path]
+        if binding is not None
+        else list(_stores_for_workspace(workspace))
+    )
+    baselines = {str(path): _get_current_rowid(path) for path in stores if path.exists()}
+    token = uuid.uuid4().hex
+    _atomic_write_json(
+        _pending_input_path(bridge_dir, token),
+        {
+            "content": content,
+            "created_at_ms": int(time.time() * 1000),
+            "baselines": baselines,
+        },
+    )
+    return token
+
+
+def _stores_for_workspace(workspace: str) -> tuple[Path, ...]:
+    """Return cursor stores under the exact canonical workspace hash."""
+    hash_dir = _cursor_chats_root() / _workspace_hash(workspace)
+    if not hash_dir.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            path
+            for path in hash_dir.glob("*/store.db")
+            if path.is_file()
+        )
+    )
+
+
+def _prompt_row_after(store_path: Path, content: str, after_rowid: int) -> int | None:
+    """Return the first new user row whose ``<user_query>`` exactly matches."""
+    expected = _strip_control_chars(content).strip()
+    for rowid, _blob_id, data in _read_blob_rows(store_path, after_rowid):
+        if isinstance(data, (bytes, bytearray)):
+            try:
+                data = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        if not isinstance(data, str):
+            continue
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("role") != "user":
+            continue
+        raw = _strip_control_chars(_content_text(obj.get("content")))
+        match = _USER_QUERY_RE.search(raw)
+        if match is not None and match.group(1).strip() == expected:
+            return rowid
+    return None
+
+
+def verify_cursor_prompt_delivery(
+    bridge_dir: Path,
+    token: str,
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 0.2,
+) -> _StoreBinding | None:
+    """Wait for cursor to commit one pending prompt, then bind its exact store.
+
+    Matching is constrained to the canonical workspace hash and to rows written
+    after the pre-injection snapshot. A unique content match is therefore tied
+    to the pane action that just occurred, not to whichever chat directory is
+    newest. ``None`` means cursor never committed the prompt before the deadline.
+    """
+    pending_path = _pending_input_path(bridge_dir, token)
+    pending = _read_pending_input(pending_path)
+    session = _read_delivery_session(bridge_dir)
+    if pending is None or session is None:
+        return None
+    content = pending.get("content")
+    raw_baselines = pending.get("baselines")
+    if not isinstance(content, str) or not isinstance(raw_baselines, dict):
+        return None
+    workspace, _launch_epoch_ms = session
+    baselines = {
+        path: rowid
+        for path, rowid in raw_baselines.items()
+        if isinstance(path, str) and isinstance(rowid, int)
+    }
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        binding = read_verified_store_binding(bridge_dir)
+        stores = (
+            [binding.store_path]
+            if binding is not None
+            else list(_stores_for_workspace(workspace))
+        )
+        matches: list[tuple[Path, int, int]] = []
+        for store_path in stores:
+            baseline = baselines.get(str(store_path), 0)
+            rowid = _prompt_row_after(store_path, content, baseline)
+            if rowid is not None:
+                matches.append((store_path, baseline, rowid))
+        matched_stores = {str(store_path) for store_path, _baseline, _rowid in matches}
+        if len(matched_stores) == 1:
+            store_path, baseline, rowid = matches[0]
+            pending["verified_store_path"] = str(store_path)
+            pending["verified_rowid"] = rowid
+            _atomic_write_json(pending_path, pending)
+            _write_store_binding(bridge_dir, store_path, baseline)
+            return _StoreBinding(store_path, baseline)
+        if len(matched_stores) > 1:
+            raise RuntimeError(
+                "cursor-native prompt appeared in multiple chat stores; refusing ambiguous binding"
+            )
+        time.sleep(poll_interval_s)
+    return None
+
+
+def resolve_cursor_pending_input(
+    bridge_dir: Path,
+    *,
+    store_path: Path,
+    rowid: int,
+) -> bool:
+    """Delete a durable pending input only after its exact user row mirrored."""
+    for path in sorted(bridge_dir.glob(f"{_PENDING_INPUT_PREFIX}*.json")):
+        pending = _read_pending_input(path)
+        if pending is None:
+            continue
+        if (
+            pending.get("verified_store_path") == str(store_path)
+            and pending.get("verified_rowid") == rowid
+        ):
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            return True
+    return False
+
+
 def _read_state(bridge_dir: Path) -> _ForwardState:
     """Load the persisted forward cursor, or a cold default."""
     try:
@@ -244,6 +503,8 @@ def clear_cursor_bridge_state(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / _STATE_FILE).unlink()
+    with contextlib.suppress(OSError):
+        (bridge_dir / _STORE_BINDING_FILE).unlink()
 
 
 def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int) -> bool:
@@ -340,6 +601,13 @@ def preseed_resume_state(
     if not store_path.exists():
         return False
     last_rowid = _get_current_rowid(store_path)
+    configure_cursor_delivery(
+        bridge_dir,
+        workspace=workspace,
+        launch_epoch_ms=launch_epoch_ms,
+        reset=False,
+    )
+    _write_store_binding(bridge_dir, store_path, last_rowid)
     _write_state(
         bridge_dir,
         _ForwardState(
@@ -962,67 +1230,54 @@ async def forward_cursor_store_to_session(
     ) as client:
         while True:
             try:
+                mirror_claimed_by_other = False
                 if store_path is None or not store_path.exists():
-                    # On cold resume the runner pre-seeds the bridge state with
-                    # the known store path (see ``preseed_resume_state``), so we
-                    # use it directly rather than running ``_discover_store`` whose
-                    # launch-recency filter would miss a store created before this
-                    # launch. For a normal fresh start the persisted path is absent
-                    # (bridge state was cleared) and we fall through to discovery.
+                    # Never adopt "the newest chat in this cwd". The injector
+                    # publishes a binding only after the exact submitted prompt
+                    # appears in a post-injection store row. Cold resume seeds
+                    # the same binding from the validated external chat id.
+                    binding: _StoreBinding | None = None
                     if persisted.store_path and Path(persisted.store_path).exists():
-                        store_path = Path(persisted.store_path)
-                        last_rowid = persisted.last_rowid
-                        _write_state(
-                            bridge_dir,
-                            _ForwardState(
-                                store_path=str(store_path),
-                                last_rowid=last_rowid,
-                                launch_epoch_ms=launch_epoch_ms,
-                            ),
+                        binding = _StoreBinding(
+                            Path(persisted.store_path),
+                            persisted.last_rowid,
                         )
-                        persisted = _ForwardState()  # consumed
-                        if not chat_id_patched:
-                            chat_id_val = store_path.parent.name
-                            await _patch_external_session_id(
-                                client, session_id=session_id, chat_id=chat_id_val
-                            )
-                            chat_id_patched = True
                     else:
-                        resolved = await asyncio.to_thread(
-                            _discover_store, workspace, launch_epoch_ms
+                        binding = await asyncio.to_thread(
+                            read_verified_store_binding,
+                            bridge_dir,
                         )
-                        if resolved is not None and not await asyncio.to_thread(
-                            _chat_claimed_by_other, bridge_dir, resolved, launch_epoch_ms
+                    if binding is not None and binding.store_path.exists():
+                        if await asyncio.to_thread(
+                            _chat_claimed_by_other,
+                            bridge_dir,
+                            binding.store_path,
+                            launch_epoch_ms,
                         ):
-                            store_path = resolved
-                            if persisted.store_path == str(resolved):
-                                last_rowid = persisted.last_rowid
-                            else:
-                                last_rowid = 0
-                                # A fresh store (cold resume) is a new chat:
-                                # reset the model dedupe so the new chat's
-                                # current model is re-posted (server no-ops if
-                                # unchanged).
-                                model_state = _ModelMirrorState()
+                            # Keep this true for the idle block in THIS poll. The
+                            # old discovery-rejected path forgot to set it and
+                            # emitted output=None (failure B).
+                            mirror_claimed_by_other = True
+                        else:
+                            store_path = binding.store_path
+                            last_rowid = binding.start_rowid
+                            model_state = _ModelMirrorState()
                             _write_state(
                                 bridge_dir,
                                 _ForwardState(
-                                    store_path=str(resolved),
+                                    store_path=str(store_path),
                                     last_rowid=last_rowid,
                                     launch_epoch_ms=launch_epoch_ms,
                                 ),
                             )
                             persisted = _ForwardState()  # consumed
-                            # Persist the cursor chat id as external_session_id so
-                            # a later cold resume can pass ``--resume <chatId>``
-                            # to the cursor-agent TUI.
                             if not chat_id_patched:
-                                chat_id_val = store_path.parent.name
                                 await _patch_external_session_id(
-                                    client, session_id=session_id, chat_id=chat_id_val
+                                    client,
+                                    session_id=session_id,
+                                    chat_id=store_path.parent.name,
                                 )
                                 chat_id_patched = True
-                mirror_claimed_by_other = False
                 if store_path is not None and store_path.exists():
                     # cursor keeps ONE chat per working dir, so two cursor-native
                     # sessions launched in the same cwd discover the same store.
@@ -1102,6 +1357,13 @@ async def forward_cursor_store_to_session(
                                     await _post_conversation_item(
                                         client, session_id=session_id, item=item
                                     )
+                                    if item.item_data.get("role") == "user":
+                                        await asyncio.to_thread(
+                                            resolve_cursor_pending_input,
+                                            bridge_dir,
+                                            store_path=store_path,
+                                            rowid=item.rowid,
+                                        )
                                 except httpx.HTTPError as exc:
                                     if post_may_have_been_delivered(exc):
                                         # Ambiguous: the request was sent but its
@@ -1219,32 +1481,42 @@ async def forward_cursor_store_to_session(
                 ):
                     if mirror_claimed_by_other:
                         _logger.warning(
-                            "skipping idle wake for session=%s; cursor chat claimed "
+                            "deferring idle wake for session=%s; cursor chat claimed "
                             "by a sibling session",
                             session_id,
                         )
-                        await asyncio.to_thread(
-                            cursor_native_status.write_posted_count,
-                            bridge_dir,
-                            total_turn_ends,
+                    elif store_path is None or not store_path.exists():
+                        _logger.warning(
+                            "deferring idle wake for session=%s; no prompt-verified "
+                            "cursor store is bound",
+                            session_id,
                         )
                     else:
-                        idle_output: str | None = None
-                        if store_path is not None and store_path.exists():
-                            idle_output = await asyncio.to_thread(
-                                _read_last_assistant_text, store_path, agent_name
+                        idle_output = await asyncio.to_thread(
+                            _read_last_assistant_text, store_path, agent_name
+                        )
+                        if idle_output is None:
+                            # The stop hook can beat SQLite by a poll or two.
+                            # Leave posted_count behind and retry; never turn
+                            # "transcript not visible yet" into an authoritative
+                            # empty child completion.
+                            _logger.warning(
+                                "deferring idle wake for session=%s; bound cursor "
+                                "store has no assistant text yet",
+                                session_id,
                             )
-                        await _post_external_session_status(
-                            client,
-                            session_id=session_id,
-                            status="idle",
-                            output=idle_output,
-                        )
-                        await asyncio.to_thread(
-                            cursor_native_status.write_posted_count,
-                            bridge_dir,
-                            total_turn_ends,
-                        )
+                        else:
+                            await _post_external_session_status(
+                                client,
+                                session_id=session_id,
+                                status="idle",
+                                output=idle_output,
+                            )
+                            await asyncio.to_thread(
+                                cursor_native_status.write_posted_count,
+                                bridge_dir,
+                                total_turn_ends,
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:
