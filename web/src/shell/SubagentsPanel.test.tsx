@@ -1393,6 +1393,34 @@ describe("SubagentsPanel", () => {
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3", expect.any(Number));
   });
 
+  it("does not fetch child sessions for closed rows", () => {
+    // Closed workers stay listed, but they cannot spawn further work —
+    // polling their empty child lists every TREE_POLL_MS is pure load.
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_closed",
+          tool: "cursor",
+          session_name: "done-work",
+          labels: { "omnigent.closed": "true" },
+        }),
+        childInfo({ id: "conv_open", tool: "cursor", session_name: "live-work" }),
+      ],
+      // Would be returned if the closed row still fetched — must not render.
+      conv_closed: [childInfo({ id: "conv_orphan", tool: "cursor", session_name: "ghost" })],
+      conv_open: [childInfo({ id: "conv_live_child", tool: "cursor", session_name: "nested" })],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(
+      screen.getAllByTestId("subagent-row").map((r) => r.getAttribute("data-child-session-id")),
+    ).toEqual(["conv_closed", "conv_open", "conv_live_child"]);
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_open", expect.any(Number));
+    expect(useChildSessionsMock).toHaveBeenCalledWith(null, expect.any(Number));
+    expect(useChildSessionsMock).not.toHaveBeenCalledWith("conv_closed", expect.any(Number));
+  });
+
   it("highlights the active grandchild row", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "conv_child", tool: "researcher" })],

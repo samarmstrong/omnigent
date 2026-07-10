@@ -718,11 +718,18 @@ function SubagentRow({
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
+  // Closed children cannot spawn further work, so skip their child-list
+  // fetch/poll entirely. Without this, a long pilot run with many closed
+  // workers fans out one ``child_sessions`` poll per closed row every
+  // TREE_POLL_MS and starves the SQLite-backed MCP path (sys_session_send
+  // then surfaces as a transport timeout).
+  const isClosed = child.labels?.["omnigent.closed"] === "true";
   // This child's own sub-agents, rendered as the next tree level.
-  // Disabled (null id) at the depth cap so the fan-out of fetches is
-  // bounded; ``useChildSessions`` skips the query entirely for null.
+  // Disabled (null id) at the depth cap / when closed so the fan-out of
+  // fetches is bounded; ``useChildSessions`` skips the query entirely for
+  // null.
   const { children: grandchildren } = useChildSessions(
-    depth < MAX_TREE_DEPTH ? child.id : null,
+    depth < MAX_TREE_DEPTH && !isClosed ? child.id : null,
     TREE_POLL_MS,
   );
   return (
