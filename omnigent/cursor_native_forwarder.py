@@ -345,9 +345,28 @@ def _prompt_row_after(store_path: Path, content: str, after_rowid: int) -> int |
             continue
         raw = _strip_control_chars(_content_text(obj.get("content")))
         match = _USER_QUERY_RE.search(raw)
-        if match is not None and match.group(1).strip() == expected:
+        if match is not None and _strip_control_chars(match.group(1)).strip() == expected:
             return rowid
     return None
+
+
+def _stores_for_prompt_verify(
+    workspace: str,
+    baselines: dict[str, int],
+    binding: _StoreBinding | None,
+) -> list[Path]:
+    """Order candidate stores so cold first-turn commits are found quickly.
+
+    A fresh pane often mints a new chat UUID only after Enter is accepted.
+    Scanning that new store before the (often dozens of) pre-existing workspace
+    siblings keeps each verify poll responsive under a contended cwd hash.
+    """
+    if binding is not None:
+        return [binding.store_path]
+    stores = list(_stores_for_workspace(workspace))
+    new_stores = [path for path in stores if str(path) not in baselines]
+    known_stores = [path for path in stores if str(path) in baselines]
+    return new_stores + known_stores
 
 
 def verify_cursor_prompt_delivery(
@@ -363,6 +382,10 @@ def verify_cursor_prompt_delivery(
     after the pre-injection snapshot. A unique content match is therefore tied
     to the pane action that just occurred, not to whichever chat directory is
     newest. ``None`` means cursor never committed the prompt before the deadline.
+
+    Cold first-turn commits are intermittently slow (tens of seconds observed
+    under a shared workspace hash); callers should pass a budget that covers
+    that tail rather than treating a short miss as a hard drop.
     """
     pending_path = _pending_input_path(bridge_dir, token)
     pending = _read_pending_input(pending_path)
@@ -382,9 +405,7 @@ def verify_cursor_prompt_delivery(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         binding = read_verified_store_binding(bridge_dir)
-        stores = (
-            [binding.store_path] if binding is not None else list(_stores_for_workspace(workspace))
-        )
+        stores = _stores_for_prompt_verify(workspace, baselines, binding)
         matches: list[tuple[Path, int, int]] = []
         for store_path in stores:
             baseline = baselines.get(str(store_path), 0)
@@ -705,8 +726,14 @@ def _content_text(content: object) -> str:
 
 
 def _strip_control_chars(text: str) -> str:
-    """Drop C0 control bytes cursor embeds in stored prompts (keep \\n and \\t)."""
-    return "".join(ch for ch in text if ch >= " " or ch in "\n\t")
+    """Drop C0 control bytes cursor embeds in stored prompts (keep ``\\n``/``\\t``).
+
+    Includes DEL (``\\x7f``). ``_clear_composer`` floods Backspace into the TUI,
+    and those bytes intermittently land inside the committed ``<user_query>``.
+    The previous ``ch >= " "`` check kept DEL (ord 127), so prompt verify
+    exact-match failed even when cursor had recorded the text.
+    """
+    return "".join(ch for ch in text if ch in "\n\t" or (" " <= ch < "\x7f"))
 
 
 def _unwrap_user_query(text: str) -> str | None:

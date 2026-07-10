@@ -68,6 +68,12 @@ class TestUnwrapUserQuery:
         raw = "<user_query>\n\x01\x0bHi there?\n\n</user_query>"
         assert fwd._unwrap_user_query(raw) == "Hi there?"
 
+    def test_strips_del_bytes_from_backspace_flood(self) -> None:
+        # _clear_composer floods BSpace; DEL (\\x7f) must not break verify match.
+        raw = "<user_query>\n" + ("\x7f" * 40) + "Author ONE bash script\n</user_query>"
+        assert fwd._unwrap_user_query(raw) == "Author ONE bash script"
+        assert "\x7f" not in fwd._strip_control_chars(raw)
+
     def test_context_dump_without_wrapper_is_skipped(self) -> None:
         assert fwd._unwrap_user_query("<user_info>\nOS Version: linux\n...") is None
 
@@ -368,6 +374,40 @@ class TestVerifiedStoreBinding:
         assert binding is not None
         assert binding.store_path == store_b
         assert fwd.read_verified_store_binding(bridge) == binding
+
+    def test_prompt_match_ignores_leading_del_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats = tmp_path / "chats"
+        workspace = "/ws"
+        bridge = tmp_path / "bridge"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats)
+        fwd.configure_cursor_delivery(
+            bridge,
+            workspace=workspace,
+            launch_epoch_ms=1_000,
+            reset=True,
+        )
+        token = fwd.begin_cursor_prompt_delivery(bridge, "clean prompt")
+        store = self._store_path(chats, workspace, "chat")
+        _make_store(
+            store,
+            [
+                (
+                    "u",
+                    _user("<user_query>\n" + ("\x7f" * 20) + "clean prompt\n</user_query>"),
+                )
+            ],
+        ).close()
+
+        binding = fwd.verify_cursor_prompt_delivery(
+            bridge,
+            token,
+            timeout_s=0.1,
+            poll_interval_s=0.001,
+        )
+        assert binding is not None
+        assert binding.store_path == store
 
     def test_pending_input_remains_until_exact_user_row_is_mirrored(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

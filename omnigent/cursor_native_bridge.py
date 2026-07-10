@@ -73,9 +73,18 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # Cursor accepting Enter is not sufficient: the TUI can drop the submit while
 # tmux still returns success. Require the exact prompt to appear in cursor's
-# SQLite transcript, retrying the whole paste once before surfacing a real error.
-_SUBMIT_VERIFY_TIMEOUT_S = 8.0
-_SUBMIT_ATTEMPTS = 2
+# SQLite transcript. Cold first-turn commits under a contended workspace hash
+# have been observed to take 30–60s after Enter before the chat store appears,
+# so verify uses backoff rather than a single short window. Re-paste only when
+# the draft is still visible; otherwise extend the store wait.
+_SUBMIT_VERIFY_TIMEOUTS_S = (8.0, 12.0, 20.0, 30.0, 45.0)
+_SUBMIT_ATTEMPTS = len(_SUBMIT_VERIFY_TIMEOUTS_S)
+# Back-compat alias for callers/tests that read the first-window constant.
+_SUBMIT_VERIFY_TIMEOUT_S = _SUBMIT_VERIFY_TIMEOUTS_S[0]
+# After paste, re-send Enter while the draft needle remains visible (Enter was
+# folded into the paste burst or the composer was not yet accepting submits).
+_ENTER_ACCEPT_TIMEOUT_S = 2.5
+_ENTER_ACCEPT_ATTEMPTS = 3
 # Pause between the ``/model`` filter landing and Enter. cursor-agent's
 # composer debounces input (~1.5s); an Enter fired too soon selects a stale
 # picker highlight. See the cursor-native e2e_ui TUI-driving notes.
@@ -615,13 +624,23 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
-def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+def _settle_pane(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    timeout_s: float,
+    require_idle: bool = False,
+) -> None:
     """Best-effort wait until the Cursor input box is ready to receive a paste.
 
     Accepts the first-run "Trust this workspace" modal (sends ``a`` at most once)
-    so the input box can mount, then waits for an idle/running input marker. Falls
-    through after the timeout (mid-turn steering has no idle placeholder) rather
-    than raising.
+    so the input box can mount, then waits for an idle/running input marker.
+
+    When *require_idle* is false (mid-turn steering / already-bound sessions),
+    falls through after the timeout rather than raising — a running turn has no
+    idle placeholder. When *require_idle* is true (cold first inject), raises if
+    no idle marker appears: pasting into a not-yet-ready composer is the main
+    cause of Enter being accepted by tmux while cursor never records the prompt.
     """
     deadline = time.monotonic() + timeout_s
     trust_accepted = False
@@ -636,6 +655,11 @@ def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> Non
             with contextlib.suppress(RuntimeError):
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "a")
         time.sleep(_POLL_INTERVAL_S)
+    if require_idle:
+        raise RuntimeError(
+            "cursor composer was not ready to accept input "
+            f"(idle markers {_IDLE_MARKERS!r} never appeared within {timeout_s:.0f}s)"
+        )
 
 
 def _clear_composer(socket_path: str, tmux_target: str) -> None:
@@ -670,6 +694,50 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
         previous = current
 
 
+def _submit_with_enter_retries(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+) -> bool:
+    """Send Enter, re-sending while *needle* remains visible in the pane.
+
+    Returns True when the draft appears to have left the composer (or *needle*
+    is empty so local verify is unavailable). Returns False when the draft is
+    still visible after the retry budget — caller should re-paste.
+    """
+    if not needle:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        time.sleep(_PASTE_SETTLE_S)
+        return True
+    for _ in range(_ENTER_ACCEPT_ATTEMPTS):
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "cursor terminal is no longer running (the TUI exited); restart the session"
+            )
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        deadline = time.monotonic() + _ENTER_ACCEPT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            pane = _capture_pane(socket_path, tmux_target)
+            if needle not in pane:
+                return True
+            time.sleep(_POLL_INTERVAL_S)
+    return needle not in _capture_pane(socket_path, tmux_target)
+
+
+def _draft_still_visible(bridge_dir: Path, content: str) -> bool:
+    """Return True when the paste needle is still sitting in the live pane."""
+    needle = _submit_needle(content)
+    if not needle:
+        return False
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return False
+    if not _session_alive(info["socket_path"], info["tmux_target"]):
+        return False
+    return needle in _capture_pane(info["socket_path"], info["tmux_target"])
+
+
 def inject_user_message(
     bridge_dir: Path,
     *,
@@ -680,9 +748,11 @@ def inject_user_message(
 
     The durable pending-input record is created before the first keystroke and
     cleared only by the transcript forwarder after the matching user row is
-    mirrored. A missing transcript row triggers one full injection retry; a
-    second miss raises so the caller reports a real delivery error instead of
-    the former false ``Turn started`` acknowledgement.
+    mirrored. A missing transcript row triggers backoff store-verify windows;
+    the paste is retried only when the draft is still visible in the composer
+    (Enter dropped). A store miss with an empty composer extends the wait —
+    cursor often commits the chat store tens of seconds after a successful
+    Enter on a cold first turn.
     """
     if not content:
         raise RuntimeError("cursor-native injection requires non-empty content")
@@ -690,25 +760,57 @@ def inject_user_message(
     # while the harness process reaches these delivery helpers only at call time.
     from omnigent.cursor_native_forwarder import (
         begin_cursor_prompt_delivery,
+        read_verified_store_binding,
         verify_cursor_prompt_delivery,
     )
 
     token = begin_cursor_prompt_delivery(bridge_dir, content)
-    for _attempt in range(1, _SUBMIT_ATTEMPTS + 1):
-        _inject_user_message_once(
-            bridge_dir,
-            content=content,
-            timeout_s=timeout_s,
-        )
+    # Cold first inject (no prior store binding): require an idle composer before
+    # pasting. Bound sessions / mid-turn steers may inject without the idle
+    # placeholder.
+    require_idle = read_verified_store_binding(bridge_dir) is None
+    paste_attempts = 0
+    for attempt_idx, verify_timeout_s in enumerate(_SUBMIT_VERIFY_TIMEOUTS_S):
+        if attempt_idx == 0:
+            _inject_user_message_once(
+                bridge_dir,
+                content=content,
+                timeout_s=timeout_s,
+                require_idle=require_idle,
+            )
+            paste_attempts += 1
+        elif _draft_still_visible(bridge_dir, content):
+            # Enter was dropped / folded; try re-Enter, then a full re-paste.
+            info = read_tmux_info(bridge_dir)
+            if info is None:
+                raise RuntimeError("cursor-native tmux target not advertised")
+            accepted = _submit_with_enter_retries(
+                info["socket_path"],
+                info["tmux_target"],
+                needle=_submit_needle(content),
+            )
+            if not accepted:
+                _inject_user_message_once(
+                    bridge_dir,
+                    content=content,
+                    timeout_s=timeout_s,
+                    require_idle=False,
+                )
+                paste_attempts += 1
+        # else: draft left the composer — cursor accepted Enter; keep waiting
+        # for the (sometimes slow) store commit without re-pasting.
         binding = verify_cursor_prompt_delivery(
             bridge_dir,
             token,
-            timeout_s=_SUBMIT_VERIFY_TIMEOUT_S,
+            timeout_s=verify_timeout_s,
         )
         if binding is not None:
             return
+        if attempt_idx + 1 < _SUBMIT_ATTEMPTS:
+            time.sleep(min(1.0 * (attempt_idx + 1), 4.0))
     raise RuntimeError(
-        f"cursor did not record the submitted prompt after {_SUBMIT_ATTEMPTS} injection attempts"
+        f"cursor did not record the submitted prompt after {_SUBMIT_ATTEMPTS} "
+        f"verify windows ({paste_attempts} paste attempt(s))"
     )
 
 
@@ -717,18 +819,21 @@ def _inject_user_message_once(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    require_idle: bool = False,
 ) -> None:
     """Perform one tmux paste + Enter attempt without claiming delivery.
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), settles, then submits with Enter (re-sent while the draft remains
+    visible).
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
     :param timeout_s: Per-readiness-gate timeout.
-    :raises RuntimeError: If the tmux target is never advertised or a tmux
-        command fails.
+    :param require_idle: When true, fail if the idle composer never mounts.
+    :raises RuntimeError: If the tmux target is never advertised, the composer
+        is not ready (when required), or a tmux command fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
@@ -740,7 +845,12 @@ def _inject_user_message_once(
         raise RuntimeError(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
-    _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
+    _settle_pane(
+        socket_path,
+        tmux_target,
+        timeout_s=timeout_s,
+        require_idle=require_idle,
+    )
     # Clear any leftover draft (e.g. the prompt cursor-agent restores into the
     # composer after a cancelled turn) so it can't prepend the new message.
     _clear_composer(socket_path, tmux_target)
@@ -777,7 +887,11 @@ def _inject_user_message_once(
                 break
             time.sleep(_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    if not _submit_with_enter_retries(socket_path, tmux_target, needle=needle):
+        # Last resort: one more clear+paste cycle is the caller's job via
+        # inject_user_message's draft-still-visible branch; surface a soft
+        # signal by leaving the draft in place for that branch to see.
+        return
 
 
 def inject_model_command(

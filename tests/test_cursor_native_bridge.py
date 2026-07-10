@@ -155,12 +155,24 @@ def test_inject_user_message_clears_before_pasting(
     captured = _install_fake_tmux(monkeypatch, pane_captures=["Add a follow-up hello marker"])
     # Avoid real sleeps in the paste-commit settle.
     monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+    # Static pane still shows the needle after Enter; stub local accept so this
+    # test stays focused on clear-before-paste ordering.
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_submit_with_enter_retries",
+        lambda *_a, **_k: True,
+    )
     from omnigent import cursor_native_forwarder
 
     monkeypatch.setattr(
         cursor_native_forwarder,
         "begin_cursor_prompt_delivery",
         lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "read_verified_store_binding",
+        lambda _bridge: object(),  # already bound → require_idle=False
     )
     monkeypatch.setattr(
         cursor_native_forwarder,
@@ -177,15 +189,15 @@ def test_inject_user_message_clears_before_pasting(
     assert first_backspace < first_paste, "draft must be cleared before the new paste"
     # The old ineffective readline clear is gone.
     assert not any("C-a" in cmd or "C-k" in cmd for cmd in captured)
-    # Submit still happens last.
-    assert any("send-keys" in cmd and "Enter" in cmd for cmd in captured)
+    # Submit is owned by the stubbed enter-retry helper after paste.
+    assert first_paste > first_backspace
 
 
 def test_inject_user_message_retries_when_cursor_does_not_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tmux-success/store-miss retries once before acknowledging delivery."""
+    """A store miss with the draft still visible re-pastes before acknowledging."""
     from omnigent import cursor_native_forwarder
 
     attempts: list[str] = []
@@ -193,12 +205,37 @@ def test_inject_user_message_retries_when_cursor_does_not_commit(
     monkeypatch.setattr(
         cursor_native_bridge,
         "_inject_user_message_once",
-        lambda _bridge, *, content, timeout_s: attempts.append(content),
+        lambda _bridge, *, content, timeout_s, require_idle=False: attempts.append(content),
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_draft_still_visible",
+        lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "read_tmux_info",
+        lambda _bridge: {"socket_path": "/tmp/sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_submit_with_enter_retries",
+        lambda *_a, **_k: False,  # re-Enter failed → full re-paste
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge.time,
+        "sleep",
+        lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
         cursor_native_forwarder,
         "begin_cursor_prompt_delivery",
         lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "read_verified_store_binding",
+        lambda _bridge: None,
     )
     monkeypatch.setattr(
         cursor_native_forwarder,
@@ -211,23 +248,91 @@ def test_inject_user_message_retries_when_cursor_does_not_commit(
     assert attempts == ["verify me", "verify me"]
 
 
-def test_inject_user_message_fails_after_two_unverified_attempts(
+def test_inject_user_message_waits_without_repaste_when_draft_cleared(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two transcript misses surface a real error instead of ``Turn started``."""
+    """Store-commit lag with an empty composer extends verify, does not re-paste."""
+    from omnigent import cursor_native_forwarder
+
+    attempts: list[str] = []
+    verify_timeouts: list[float] = []
+    verification = iter([None, None, object()])
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_inject_user_message_once",
+        lambda _bridge, *, content, timeout_s, require_idle=False: attempts.append(content),
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_draft_still_visible",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge.time,
+        "sleep",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "begin_cursor_prompt_delivery",
+        lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "read_verified_store_binding",
+        lambda _bridge: None,
+    )
+
+    def _verify(_bridge, _token, *, timeout_s, poll_interval_s=0.2):
+        del poll_interval_s
+        verify_timeouts.append(timeout_s)
+        return next(verification)
+
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "verify_cursor_prompt_delivery",
+        _verify,
+    )
+
+    cursor_native_bridge.inject_user_message(tmp_path, content="slow commit")
+
+    assert attempts == ["slow commit"]
+    assert verify_timeouts == [8.0, 12.0, 20.0]
+
+
+def test_inject_user_message_fails_after_exhausted_verify_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausted backoff windows surface a real error instead of ``Turn started``."""
     from omnigent import cursor_native_forwarder
 
     attempts: list[str] = []
     monkeypatch.setattr(
         cursor_native_bridge,
         "_inject_user_message_once",
-        lambda _bridge, *, content, timeout_s: attempts.append(content),
+        lambda _bridge, *, content, timeout_s, require_idle=False: attempts.append(content),
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge,
+        "_draft_still_visible",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        cursor_native_bridge.time,
+        "sleep",
+        lambda *_a, **_k: None,
     )
     monkeypatch.setattr(
         cursor_native_forwarder,
         "begin_cursor_prompt_delivery",
         lambda _bridge, _content: "token",
+    )
+    monkeypatch.setattr(
+        cursor_native_forwarder,
+        "read_verified_store_binding",
+        lambda _bridge: None,
     )
     monkeypatch.setattr(
         cursor_native_forwarder,
@@ -238,7 +343,7 @@ def test_inject_user_message_fails_after_two_unverified_attempts(
     with pytest.raises(RuntimeError, match="did not record"):
         cursor_native_bridge.inject_user_message(tmp_path, content="missing")
 
-    assert attempts == ["missing", "missing"]
+    assert attempts == ["missing"]
 
 
 # Idle marker so _settle_pane returns and _clear_composer settles at once.
