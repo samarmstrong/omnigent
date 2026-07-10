@@ -48,7 +48,7 @@ from omnigent.model_override import (
     normalize_model_for_provider,
     validate_model_override,
 )
-from omnigent.native_coding_agents import public_agent_name
+from omnigent.native_coding_agents import native_coding_agent_for_harness, public_agent_name
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -4265,6 +4265,31 @@ async def _session_close_via_rest(
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
     if patch.status_code != 200:
         return json.dumps({"error": f"sys_session_close returned {patch.status_code}"})
+    native_agent = native_coding_agent_for_harness(target_snap.get("harness"))
+    if native_agent is not None:
+        # Closing a sub-agent is also a runtime lifecycle edge. Delete its
+        # deterministic native pane through the server proxy; the runner-side
+        # delete handler cancels the registered transcript/approval forwarder.
+        from omnigent.entities.session_resources import terminal_resource_id
+
+        terminal_id = terminal_resource_id(native_agent.terminal_name, "main")
+        try:
+            cleanup = await server_client.delete(
+                f"/v1/sessions/{target_id}/resources/terminals/{terminal_id}",
+                timeout=30.0,
+            )
+            if cleanup.status_code not in (200, 404):
+                logger.warning(
+                    "sys_session_close runtime cleanup returned %s for %s",
+                    cleanup.status_code,
+                    target_id,
+                )
+        except Exception:  # noqa: BLE001 — metadata close remains authoritative
+            logger.warning(
+                "sys_session_close could not clean up native runtime for %s",
+                target_id,
+                exc_info=True,
+            )
     return json.dumps(
         {
             "closed": True,

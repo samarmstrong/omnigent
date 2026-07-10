@@ -44,10 +44,12 @@ import httpx
 
 from omnigent.cursor_native_bridge import send_cursor_pane_keys
 
-# Reuse the forwarder's store discovery and WAL-aware blob reader so the
-# transcript-based detector binds to the SAME cursor chat the forwarder mirrors
-# (one chat per workspace) and reads the live ``-wal`` state correctly.
-from omnigent.cursor_native_forwarder import _discover_store, _read_blob_rows
+# Reuse the forwarder's prompt-verified binding and WAL-aware blob reader so the
+# approval detector can never adopt a sibling pane's chat from a shared cwd.
+from omnigent.cursor_native_forwarder import (
+    _read_blob_rows,
+    read_verified_store_binding,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -716,9 +718,11 @@ async def supervise_cursor_transcript_elicitations(
         while True:
             try:
                 if store_path is None or not store_path.exists():
-                    store_path = await asyncio.to_thread(
-                        _discover_store, workspace, launch_epoch_ms
+                    binding = await asyncio.to_thread(
+                        read_verified_store_binding,
+                        bridge_dir,
                     )
+                    store_path = binding.store_path if binding is not None else None
                 pending_calls = (
                     await asyncio.to_thread(read_cursor_pending_tool_calls, store_path)
                     if store_path is not None

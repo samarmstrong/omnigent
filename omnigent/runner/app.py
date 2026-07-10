@@ -2112,10 +2112,9 @@ async def _auto_create_cursor_terminal(
     from omnigent.cursor_native import resolve_cursor_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    # Stamp the launch time before the TUI starts. cursor creates the chat's
-    # on-disk store lazily on the first message, so its ``meta.json``
-    # ``createdAtMs`` is always >= this — which lets the forwarder discover
-    # *this* session's chat by recency under ``~/.cursor/chats/<md5(cwd)>``.
+    # Stamp the launch time before the TUI starts. The injector records it with
+    # the canonical workspace and binds a store only after this pane's exact
+    # prompt appears there — never by adopting the newest chat in a shared cwd.
     launch_epoch_ms = int(time.time() * 1000)
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so the old and new tasks can't both mirror (double-posting),
@@ -2130,7 +2129,11 @@ async def _auto_create_cursor_terminal(
         write_hooks_config,
         write_mcp_config,
     )
-    from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
+    from omnigent.cursor_native_forwarder import (
+        clear_cursor_bridge_state,
+        configure_cursor_delivery,
+        preseed_resume_state,
+    )
     from omnigent.cursor_native_status import clear_cursor_status_state
     from omnigent.cursor_native_usage import clear_cursor_usage_state
 
@@ -2193,6 +2196,12 @@ async def _auto_create_cursor_terminal(
                 session_id,
             )
             resume_chat_id = None
+    configure_cursor_delivery(
+        bridge_dir,
+        workspace=workspace,
+        launch_epoch_ms=launch_epoch_ms,
+        reset=not preseeded,
+    )
     # A fork bound to cursor carries history as a text preamble: cursor's
     # conversation is server-backed, so there's no local store to seed for
     # ``--resume`` (a fresh fork has no prior chat anyway → ``not preseeded``).
@@ -16872,6 +16881,10 @@ def create_runner_app(
         :param terminal_id: Opaque terminal resource id.
         :returns: Deletion confirmation object.
         """
+        terminal_role = resource_registry.terminal_resource_role(
+            session_id,
+            terminal_id,
+        )
         closed = await resource_registry.close_terminal(
             session_id,
             terminal_id,
@@ -16886,6 +16899,11 @@ def create_runner_app(
                     }
                 },
             )
+        if is_native_harness(terminal_role):
+            # Transcript/approval forwarders are pane-scoped runtime too. Leaving
+            # one alive after an explicit close lets it adopt another chat from
+            # the same cwd and cross-post into this session.
+            await _cancel_auto_forwarder_task(session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -19121,6 +19139,10 @@ def create_runner_app(
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
+                # The pane and its store mirror share one lifecycle. A reaped
+                # pane must not leave a forwarder polling long enough to bind an
+                # unrelated chat created later in the same working directory.
+                await _cancel_auto_forwarder_task(pane.conversation_id)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,

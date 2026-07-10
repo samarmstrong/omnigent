@@ -71,6 +71,11 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# Cursor accepting Enter is not sufficient: the TUI can drop the submit while
+# tmux still returns success. Require the exact prompt to appear in cursor's
+# SQLite transcript, retrying the whole paste once before surfacing a real error.
+_SUBMIT_VERIFY_TIMEOUT_S = 8.0
+_SUBMIT_ATTEMPTS = 2
 # Pause between the ``/model`` filter landing and Enter. cursor-agent's
 # composer debounces input (~1.5s); an Enter fired too soon selects a stale
 # picker highlight. See the cursor-native e2e_ui TUI-driving notes.
@@ -671,7 +676,50 @@ def inject_user_message(
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
-    """Deliver a web-UI user message into the Cursor TUI via a tmux bracketed paste.
+    """Inject *content* and return only after Cursor durably records it.
+
+    The durable pending-input record is created before the first keystroke and
+    cleared only by the transcript forwarder after the matching user row is
+    mirrored. A missing transcript row triggers one full injection retry; a
+    second miss raises so the caller reports a real delivery error instead of
+    the former false ``Turn started`` acknowledgement.
+    """
+    if not content:
+        raise RuntimeError("cursor-native injection requires non-empty content")
+    # Local import avoids a module cycle: the forwarder imports bridge constants,
+    # while the harness process reaches these delivery helpers only at call time.
+    from omnigent.cursor_native_forwarder import (
+        begin_cursor_prompt_delivery,
+        verify_cursor_prompt_delivery,
+    )
+
+    token = begin_cursor_prompt_delivery(bridge_dir, content)
+    for attempt in range(1, _SUBMIT_ATTEMPTS + 1):
+        _inject_user_message_once(
+            bridge_dir,
+            content=content,
+            timeout_s=timeout_s,
+        )
+        binding = verify_cursor_prompt_delivery(
+            bridge_dir,
+            token,
+            timeout_s=_SUBMIT_VERIFY_TIMEOUT_S,
+        )
+        if binding is not None:
+            return
+    raise RuntimeError(
+        "cursor did not record the submitted prompt after "
+        f"{_SUBMIT_ATTEMPTS} injection attempts"
+    )
+
+
+def _inject_user_message_once(
+    bridge_dir: Path,
+    *,
+    content: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Perform one tmux paste + Enter attempt without claiming delivery.
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
@@ -683,8 +731,6 @@ def inject_user_message(
     :raises RuntimeError: If the tmux target is never advertised or a tmux
         command fails.
     """
-    if not content:
-        raise RuntimeError("cursor-native injection requires non-empty content")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]

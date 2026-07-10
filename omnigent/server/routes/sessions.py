@@ -575,7 +575,10 @@ _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
-_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
+# Cursor-native now verifies that the prompt reached cursor's durable transcript
+# and may retry the paste once. Keep the server→runner budget above that bounded
+# verification path; other native injectors return well inside this ceiling.
+_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 90.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
 # Banner code for the non-fatal notice shown when a native codex session
